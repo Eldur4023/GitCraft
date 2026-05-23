@@ -80,8 +80,7 @@ gitcraft log survival       # commit history
 
 > **Important:** always stop the server before pushing or pulling.
 > Minecraft writes `.mca` region files non-atomically — syncing while the server
-> is running risks silent chunk corruption. GitCraft enforces this by checking
-> for `session.lock` and aborting if it exists.
+> is running risks silent chunk corruption. GitCraft does not enforce this, so be careful!
 
 ## Why not rsync / syncthing / git-lfs?
 
