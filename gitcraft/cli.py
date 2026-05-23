@@ -1,4 +1,6 @@
 import json
+import queue
+import threading
 from pathlib import Path
 
 import click
@@ -36,7 +38,46 @@ def _connect(cfg: dict) -> SFTPTransport:
     )
 
 
+def _upload_parallel(blocks: list[tuple[str, bytes]], cfg: dict, workers: int) -> None:
+    """Upload blocks concurrently — each worker holds its own SFTP connection."""
+    if not blocks:
+        return
+    q: queue.Queue = queue.Queue()
+    for item in blocks:
+        q.put(item)
+
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def worker():
+        transport = _connect(cfg)
+        try:
+            while True:
+                try:
+                    bh, bdata = q.get_nowait()
+                    transport.put_block(bh, bdata)
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    with lock:
+                        errors.append(e)
+                    break
+        finally:
+            transport.close()
+
+    n = min(workers, len(blocks))
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if errors:
+        raise errors[0]
+
+
 def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
+    workers = cfg.get("workers", 4)
     index = load_index(world_dir)
     known = load_known_objects(world_dir)
     files = scan(world_dir)
@@ -52,34 +93,89 @@ def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
         click.echo("Nothing to push.")
         return False
 
-    transport = _connect(cfg)
+    # Collect everything to upload before opening connections
     new_tree = dict(index["tree"])
     new_known: set[str] = set()
-    try:
-        for rel, (abs_path, file_hash) in changed.items():
-            data = abs_path.read_bytes()
-            blocks = split_blocks(data)
-            block_hashes = [h for h, _ in blocks]
-            manifest_hash, manifest_data = make_manifest(block_hashes, len(data))
+    blocks_to_upload: list[tuple[str, bytes]] = []
+    manifests_to_upload: list[tuple[str, bytes]] = []
 
-            for bh, bdata in blocks:
-                if bh not in known:
-                    transport.put_block(bh, bdata)
-                    new_known.add(bh)
+    for rel, (abs_path, file_hash) in changed.items():
+        data = abs_path.read_bytes()
+        blocks = split_blocks(data)
+        block_hashes = [h for h, _ in blocks]
+        manifest_hash, manifest_data = make_manifest(block_hashes, len(data))
 
-            if manifest_hash not in known:
-                transport.put_manifest(manifest_hash, manifest_data)
-                new_known.add(manifest_hash)
+        for bh, bdata in blocks:
+            if bh not in known:
+                blocks_to_upload.append((bh, bdata))
+                new_known.add(bh)
 
-            new_tree[rel] = {"sha256": file_hash, "manifest": manifest_hash}
+        if manifest_hash not in known:
+            manifests_to_upload.append((manifest_hash, manifest_data))
+            new_known.add(manifest_hash)
 
-        for rel in deleted:
-            del new_tree[rel]
+        new_tree[rel] = {"sha256": file_hash, "manifest": manifest_hash}
 
-        commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
-        transport.put_commit(commit_hash, commit_data)
-        new_known.add(commit_hash)
-        transport.set_head(commit_hash)
+    for rel in deleted:
+        del new_tree[rel]
+
+    total = len(blocks_to_upload) + len(manifests_to_upload)
+    click.echo(f"Uploading {total} objects ({len(blocks_to_upload)} blocks) with {workers} workers...")
+
+    with click.progressbar(length=total, width=40) as bar:
+        # Blocks in parallel
+        done_lock = threading.Lock()
+
+        def tracked_upload(bh, bdata, transport):
+            transport.put_block(bh, bdata)
+            with done_lock:
+                bar.update(1)
+
+        q: queue.Queue = queue.Queue()
+        for bh, bdata in blocks_to_upload:
+            q.put((bh, bdata))
+
+        errors: list[Exception] = []
+
+        def worker():
+            transport = _connect(cfg)
+            try:
+                while True:
+                    try:
+                        bh, bdata = q.get_nowait()
+                        tracked_upload(bh, bdata, transport)
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        with done_lock:
+                            errors.append(e)
+                        break
+            finally:
+                transport.close()
+
+        n = min(workers, max(len(blocks_to_upload), 1))
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if errors:
+            raise errors[0]
+
+        # Manifests and commit on a single connection (small, few)
+        transport = _connect(cfg)
+        try:
+            for mh, mdata in manifests_to_upload:
+                transport.put_manifest(mh, mdata)
+                bar.update(1)
+
+            commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
+            transport.put_commit(commit_hash, commit_data)
+            new_known.add(commit_hash)
+            transport.set_head(commit_hash)
+        finally:
+            transport.close()
 
         index.update({"head": commit_hash, "tree": new_tree})
         save_index(world_dir, index)
