@@ -186,8 +186,6 @@ def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
             parts.append(f"{len(deleted)} deleted")
         click.echo(f"[{commit_hash[:12]}] {', '.join(parts)}")
         return True
-    finally:
-        transport.close()
 
 
 def _pull(world_dir: Path, cfg: dict) -> bool:
