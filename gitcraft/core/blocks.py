@@ -1,7 +1,7 @@
 import hashlib
 from pathlib import Path
 
-BLOCK_SIZE = 4096
+BLOCK_SIZE = 524288  # 512 KB
 
 
 def hash_file(path: Path) -> str:
