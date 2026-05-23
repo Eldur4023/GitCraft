@@ -5,7 +5,7 @@ Inspired by Git and Steam Cloud Save — only the changed parts travel over the 
 
 ## How it works
 
-When you push, GitCraft splits each world file into 4 KB blocks and computes a SHA-256 for each one.
+When you push, GitCraft splits each world file into 512 KB blocks and computes a SHA-256 for each one.
 Only blocks the server has never seen before get uploaded.
 A commit object records the current state of the world (like a Git tree), and `HEAD` on the server always points to the latest one.
 
