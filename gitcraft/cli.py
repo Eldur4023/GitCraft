@@ -1,6 +1,5 @@
+import asyncio
 import json
-import queue
-import threading
 from pathlib import Path
 
 import click
@@ -11,7 +10,7 @@ from .core.blocks import hash_file, split_blocks
 from .core.index import add_known_objects, load_index, load_known_objects, save_index
 from .core.objects import make_commit, make_manifest
 from .core.snapshot import scan
-from .transport.sftp import SFTPTransport
+from .transport.sftp import AsyncSFTPTransport
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -25,10 +24,9 @@ def _world_dir(name: str) -> Path:
         )
 
 
-
-def _connect(cfg: dict) -> SFTPTransport:
+async def _connect(cfg: dict) -> AsyncSFTPTransport:
     r = cfg["remote"]
-    return SFTPTransport(
+    return await AsyncSFTPTransport.connect(
         host=r["host"],
         port=r.get("port", 22),
         user=r["user"],
@@ -38,46 +36,8 @@ def _connect(cfg: dict) -> SFTPTransport:
     )
 
 
-def _upload_parallel(blocks: list[tuple[str, bytes]], cfg: dict, workers: int) -> None:
-    """Upload blocks concurrently — each worker holds its own SFTP connection."""
-    if not blocks:
-        return
-    q: queue.Queue = queue.Queue()
-    for item in blocks:
-        q.put(item)
-
-    errors: list[Exception] = []
-    lock = threading.Lock()
-
-    def worker():
-        transport = _connect(cfg)
-        try:
-            while True:
-                try:
-                    bh, bdata = q.get_nowait()
-                    transport.put_block(bh, bdata)
-                except queue.Empty:
-                    break
-                except Exception as e:
-                    with lock:
-                        errors.append(e)
-                    break
-        finally:
-            transport.close()
-
-    n = min(workers, len(blocks))
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    if errors:
-        raise errors[0]
-
-
-def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
-    workers = cfg.get("workers", 4)
+async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
+    concurrency = cfg.get("workers", 32)
     index = load_index(world_dir)
     known = load_known_objects(world_dir)
     files = scan(world_dir)
@@ -93,7 +53,6 @@ def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
         click.echo("Nothing to push.")
         return False
 
-    # Collect everything to upload before opening connections
     new_tree = dict(index["tree"])
     new_known: set[str] = set()
     blocks_to_upload: list[tuple[str, bytes]] = []
@@ -120,78 +79,43 @@ def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
         del new_tree[rel]
 
     total = len(blocks_to_upload) + len(manifests_to_upload)
-    click.echo(f"Uploading {total} objects ({len(blocks_to_upload)} blocks) with {workers} workers...")
+    click.echo(f"Uploading {total} objects ({len(blocks_to_upload)} blocks, concurrency={concurrency})...")
 
-    with click.progressbar(length=total, width=40) as bar:
-        # Blocks in parallel
-        done_lock = threading.Lock()
-
-        def tracked_upload(bh, bdata, transport):
-            transport.put_block(bh, bdata)
-            with done_lock:
-                bar.update(1)
-
-        q: queue.Queue = queue.Queue()
-        for bh, bdata in blocks_to_upload:
-            q.put((bh, bdata))
-
-        errors: list[Exception] = []
-
-        def worker():
-            transport = _connect(cfg)
-            try:
-                while True:
-                    try:
-                        bh, bdata = q.get_nowait()
-                        tracked_upload(bh, bdata, transport)
-                    except queue.Empty:
-                        break
-                    except Exception as e:
-                        with done_lock:
-                            errors.append(e)
-                        break
-            finally:
-                transport.close()
-
-        n = min(workers, max(len(blocks_to_upload), 1))
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        if errors:
-            raise errors[0]
-
-        # Manifests and commit on a single connection (small, few)
-        transport = _connect(cfg)
-        try:
+    transport = await _connect(cfg)
+    try:
+        with click.progressbar(length=total, width=40) as bar:
+            await transport.put_blocks(
+                blocks_to_upload,
+                on_progress=lambda: bar.update(1),
+                concurrency=concurrency,
+            )
             for mh, mdata in manifests_to_upload:
-                transport.put_manifest(mh, mdata)
+                await transport.put_manifest(mh, mdata)
                 bar.update(1)
 
             commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
-            transport.put_commit(commit_hash, commit_data)
+            await transport.put_commit(commit_hash, commit_data)
             new_known.add(commit_hash)
-            transport.set_head(commit_hash)
-        finally:
-            transport.close()
+            await transport.set_head(commit_hash)
+    finally:
+        await transport.close()
 
-        index.update({"head": commit_hash, "tree": new_tree})
-        save_index(world_dir, index)
-        add_known_objects(world_dir, new_known)
+    index.update({"head": commit_hash, "tree": new_tree})
+    save_index(world_dir, index)
+    add_known_objects(world_dir, new_known)
 
-        parts = [f"{len(changed)} changed"]
-        if deleted:
-            parts.append(f"{len(deleted)} deleted")
-        click.echo(f"[{commit_hash[:12]}] {', '.join(parts)}")
-        return True
+    parts = [f"{len(changed)} changed"]
+    if deleted:
+        parts.append(f"{len(deleted)} deleted")
+    click.echo(f"[{commit_hash[:12]}] {', '.join(parts)}")
+    return True
 
 
-def _pull(world_dir: Path, cfg: dict) -> bool:
-    transport = _connect(cfg)
+async def _pull_async(world_dir: Path, cfg: dict) -> bool:
+    concurrency = cfg.get("workers", 32)
+    transport = await _connect(cfg)
     try:
-        remote_head = transport.get_head()
+        remote_head = await transport.get_head()
         if not remote_head:
             click.echo("Remote has no commits.")
             return False
@@ -201,7 +125,7 @@ def _pull(world_dir: Path, cfg: dict) -> bool:
             click.echo("Already up to date.")
             return False
 
-        commit = json.loads(transport.get_commit(remote_head))
+        commit = json.loads(await transport.get_commit(remote_head))
         remote_tree = commit["tree"]
 
         to_fetch = [
@@ -210,10 +134,32 @@ def _pull(world_dir: Path, cfg: dict) -> bool:
             if index["tree"].get(rel, {}).get("sha256") != meta["sha256"]
         ]
 
-        for rel, meta in to_fetch:
-            manifest = json.loads(transport.get_manifest(meta["manifest"]))
-            file_data = b"".join(transport.get_block(bh) for bh in manifest["blocks"])
-            file_data = file_data[: manifest["size"]]
+        # Resolve all manifests concurrently
+        click.echo(f"Resolving {len(to_fetch)} manifest(s)...")
+        manifest_hashes = [meta["manifest"] for _, meta in to_fetch]
+        raw_manifests = await asyncio.gather(
+            *[transport.get_manifest(mh) for mh in manifest_hashes]
+        )
+        fetches = [
+            (rel, meta, json.loads(raw))
+            for (rel, meta), raw in zip(to_fetch, raw_manifests)
+        ]
+        all_block_hashes = [bh for _, _, m in fetches for bh in m["blocks"]]
+        total_blocks = len(all_block_hashes)
+
+        click.echo(f"Downloading {total_blocks} blocks for {len(to_fetch)} file(s)...")
+        with click.progressbar(length=total_blocks, width=40) as bar:
+            fetched_blocks: list[bytes] = await transport.get_blocks(
+                all_block_hashes,
+                on_progress=lambda: bar.update(1),
+                concurrency=concurrency,
+            )
+
+        # Reassemble files from the flat block list
+        block_iter = iter(fetched_blocks)
+        for rel, meta, manifest in fetches:
+            blocks = [next(block_iter) for _ in manifest["blocks"]]
+            file_data = b"".join(blocks)[: manifest["size"]]
             dest = world_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(file_data)
@@ -230,7 +176,15 @@ def _pull(world_dir: Path, cfg: dict) -> bool:
         click.echo(f"[{remote_head[:12]}] Updated {len(to_fetch)} file(s).")
         return True
     finally:
-        transport.close()
+        await transport.close()
+
+
+def _push(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
+    return asyncio.run(_push_async(world_dir, cfg, message))
+
+
+def _pull(world_dir: Path, cfg: dict) -> bool:
+    return asyncio.run(_pull_async(world_dir, cfg))
 
 
 # ── commands ──────────────────────────────────────────────────────────────────

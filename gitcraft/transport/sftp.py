@@ -1,103 +1,142 @@
+import asyncio
 import gzip
-import io
 from pathlib import PurePosixPath
+from typing import Callable
 
-import paramiko
+import asyncssh
 
 
-class SFTPTransport:
-    def __init__(
-        self,
+class AsyncSFTPTransport:
+    def __init__(self, conn: asyncssh.SSHClientConnection, sftp: asyncssh.SFTPClient, base: str):
+        self._conn = conn
+        self._sftp = sftp
+        self._base = PurePosixPath(base)
+        self._created_prefixes: set[str] = set()
+        self._prefix_lock = asyncio.Lock()
+
+    @classmethod
+    async def connect(
+        cls,
         host: str,
         port: int,
         user: str,
         remote_path: str,
         key_file: str | None = None,
         password: str | None = None,
-    ):
-        self._base = PurePosixPath(remote_path)
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._client.connect(
-            host,
-            port=port,
-            username=user,
-            password=password or None,
-            key_filename=key_file or None,
-        )
-        self._sftp = self._client.open_sftp()
-        self._init_remote()
+    ) -> "AsyncSFTPTransport":
+        kwargs: dict = dict(host=host, port=port, username=user, known_hosts=None)
+        if key_file:
+            kwargs["client_keys"] = [str(key_file)]
+        if password:
+            kwargs["password"] = password
 
-    def _init_remote(self) -> None:
+        conn = await asyncssh.connect(**kwargs)
+        sftp = await conn.start_sftp_client()
+        transport = cls(conn, sftp, remote_path)
+        await transport._init_remote()
+        return transport
+
+    async def _init_remote(self) -> None:
         for sub in ["objects/commits", "objects/blocks", "objects/manifests"]:
-            self._mkdirp(str(self._base / sub))
-
-    def _mkdirp(self, path: str) -> None:
-        parts = list(PurePosixPath(path).parts)
-        for i in range(1, len(parts) + 1):
-            sub = str(PurePosixPath(*parts[:i]))
-            try:
-                self._sftp.stat(sub)
-            except FileNotFoundError:
-                try:
-                    self._sftp.mkdir(sub)
-                except OSError:
-                    pass  # concurrent mkdir race is fine
+            await self._sftp.makedirs(str(self._base / sub), exist_ok=True)
 
     def _p(self, *parts: str) -> str:
         return str(self._base.joinpath(*parts))
 
+    async def _ensure_block_prefix(self, prefix: str) -> None:
+        if prefix in self._created_prefixes:
+            return
+        async with self._prefix_lock:
+            if prefix in self._created_prefixes:
+                return
+            try:
+                await self._sftp.mkdir(self._p("objects/blocks", prefix))
+            except asyncssh.SFTPError:
+                pass  # already exists
+            self._created_prefixes.add(prefix)
+
     # HEAD
 
-    def get_head(self) -> str | None:
+    async def get_head(self) -> str | None:
         try:
-            with self._sftp.open(self._p("HEAD"), "r") as f:
-                value = f.read().decode().strip()
+            async with self._sftp.open(self._p("HEAD"), "r") as f:
+                value = (await f.read()).strip()
                 return value or None
-        except FileNotFoundError:
+        except asyncssh.SFTPNoSuchFile:
             return None
 
-    def set_head(self, commit_hash: str) -> None:
-        with self._sftp.open(self._p("HEAD"), "w") as f:
-            f.write(commit_hash.encode())
+    async def set_head(self, commit_hash: str) -> None:
+        async with self._sftp.open(self._p("HEAD"), "w") as f:
+            await f.write(commit_hash)
 
-    # Blocks (gzip-compressed, 2-char prefix sharding)
+    # Blocks
 
-    def put_block(self, block_hash: str, data: bytes) -> None:
+    async def put_block(self, block_hash: str, data: bytes) -> None:
         prefix = block_hash[:2]
-        dir_path = self._p("objects/blocks", prefix)
-        try:
-            self._sftp.stat(dir_path)
-        except FileNotFoundError:
-            self._sftp.mkdir(dir_path)
+        await self._ensure_block_prefix(prefix)
         compressed = gzip.compress(data, compresslevel=6)
-        self._sftp.putfo(io.BytesIO(compressed), self._p("objects/blocks", prefix, block_hash[2:]))
+        async with self._sftp.open(self._p("objects/blocks", prefix, block_hash[2:]), "wb") as f:
+            await f.write(compressed)
 
-    def get_block(self, block_hash: str) -> bytes:
-        buf = io.BytesIO()
-        self._sftp.getfo(self._p("objects/blocks", block_hash[:2], block_hash[2:]), buf)
-        return gzip.decompress(buf.getvalue())
+    async def get_block(self, block_hash: str) -> bytes:
+        async with self._sftp.open(
+            self._p("objects/blocks", block_hash[:2], block_hash[2:]), "rb"
+        ) as f:
+            return gzip.decompress(await f.read())
 
-    # Manifests (plain JSON, small)
+    async def put_blocks(
+        self,
+        blocks: list[tuple[str, bytes]],
+        on_progress: Callable | None = None,
+        concurrency: int = 32,
+    ) -> None:
+        sem = asyncio.Semaphore(concurrency)
 
-    def put_manifest(self, manifest_hash: str, data: bytes) -> None:
-        self._sftp.putfo(io.BytesIO(data), self._p("objects/manifests", manifest_hash))
+        async def upload(bh: str, bdata: bytes) -> None:
+            async with sem:
+                await self.put_block(bh, bdata)
+                if on_progress:
+                    on_progress()
 
-    def get_manifest(self, manifest_hash: str) -> bytes:
-        buf = io.BytesIO()
-        self._sftp.getfo(self._p("objects/manifests", manifest_hash), buf)
-        return buf.getvalue()
+        await asyncio.gather(*[upload(bh, bdata) for bh, bdata in blocks])
 
-    # Commits (plain JSON)
+    async def get_blocks(
+        self,
+        hashes: list[str],
+        on_progress: Callable | None = None,
+        concurrency: int = 32,
+    ) -> list[bytes]:
+        sem = asyncio.Semaphore(concurrency)
 
-    def put_commit(self, commit_hash: str, data: bytes) -> None:
-        self._sftp.putfo(io.BytesIO(data), self._p("objects/commits", commit_hash))
+        async def fetch(h: str) -> bytes:
+            async with sem:
+                data = await self.get_block(h)
+                if on_progress:
+                    on_progress()
+                return data
 
-    def get_commit(self, commit_hash: str) -> bytes:
-        buf = io.BytesIO()
-        self._sftp.getfo(self._p("objects/commits", commit_hash), buf)
-        return buf.getvalue()
+        return await asyncio.gather(*[fetch(h) for h in hashes])
 
-    def close(self) -> None:
-        self._sftp.close()
-        self._client.close()
+    # Manifests
+
+    async def put_manifest(self, manifest_hash: str, data: bytes) -> None:
+        async with self._sftp.open(self._p("objects/manifests", manifest_hash), "wb") as f:
+            await f.write(data)
+
+    async def get_manifest(self, manifest_hash: str) -> bytes:
+        async with self._sftp.open(self._p("objects/manifests", manifest_hash), "rb") as f:
+            return await f.read()
+
+    # Commits
+
+    async def put_commit(self, commit_hash: str, data: bytes) -> None:
+        async with self._sftp.open(self._p("objects/commits", commit_hash), "wb") as f:
+            await f.write(data)
+
+    async def get_commit(self, commit_hash: str) -> bytes:
+        async with self._sftp.open(self._p("objects/commits", commit_hash), "rb") as f:
+            return await f.read()
+
+    async def close(self) -> None:
+        self._sftp.exit()
+        self._conn.close()
