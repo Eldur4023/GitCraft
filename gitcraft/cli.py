@@ -10,7 +10,7 @@ from .core.blocks import hash_file, split_blocks
 from .core.index import add_known_objects, load_index, load_known_objects, save_index
 from .core.objects import make_commit, make_manifest
 from .core.snapshot import scan
-from .transport.sftp import AsyncSFTPTransport
+from .transport.sftp import SSHTransport
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -24,9 +24,9 @@ def _world_dir(name: str) -> Path:
         )
 
 
-async def _connect(cfg: dict) -> AsyncSFTPTransport:
+async def _connect(cfg: dict) -> SSHTransport:
     r = cfg["remote"]
-    return await AsyncSFTPTransport.connect(
+    return await SSHTransport.connect(
         host=r["host"],
         port=r.get("port", 22),
         user=r["user"],
@@ -37,7 +37,6 @@ async def _connect(cfg: dict) -> AsyncSFTPTransport:
 
 
 async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
-    concurrency = cfg.get("workers", 32)
     index = load_index(world_dir)
     known = load_known_objects(world_dir)
     files = scan(world_dir)
@@ -78,25 +77,22 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
     for rel in deleted:
         del new_tree[rel]
 
-    total = len(blocks_to_upload) + len(manifests_to_upload)
-    click.echo(f"Uploading {total} objects ({len(blocks_to_upload)} blocks, concurrency={concurrency})...")
-
+    click.echo(
+        f"Uploading {len(blocks_to_upload)} block(s) + "
+        f"{len(manifests_to_upload)} manifest(s) via tar..."
+    )
     transport = await _connect(cfg)
     try:
-        with click.progressbar(length=total, width=40) as bar:
-            await transport.put_blocks(
-                blocks_to_upload,
-                on_progress=lambda: bar.update(1),
-                concurrency=concurrency,
-            )
-            for mh, mdata in manifests_to_upload:
-                await transport.put_manifest(mh, mdata)
-                bar.update(1)
+        with click.progressbar(length=2, label="Uploading", width=40) as bar:
+            await transport.put_blocks(blocks_to_upload)
+            bar.update(1)
+            await transport.put_manifests(manifests_to_upload)
+            bar.update(1)
 
-            commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
-            await transport.put_commit(commit_hash, commit_data)
-            new_known.add(commit_hash)
-            await transport.set_head(commit_hash)
+        commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
+        await transport.put_commit(commit_hash, commit_data)
+        new_known.add(commit_hash)
+        await transport.set_head(commit_hash)
     finally:
         await transport.close()
 
@@ -112,7 +108,6 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
 
 
 async def _pull_async(world_dir: Path, cfg: dict) -> bool:
-    concurrency = cfg.get("workers", 32)
     transport = await _connect(cfg)
     try:
         remote_head = await transport.get_head()
@@ -134,28 +129,22 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
             if index["tree"].get(rel, {}).get("sha256") != meta["sha256"]
         ]
 
-        # Resolve all manifests concurrently
-        click.echo(f"Resolving {len(to_fetch)} manifest(s)...")
+        click.echo(f"Fetching {len(to_fetch)} manifest(s) via tar...")
         manifest_hashes = [meta["manifest"] for _, meta in to_fetch]
-        raw_manifests = await asyncio.gather(
-            *[transport.get_manifest(mh) for mh in manifest_hashes]
-        )
+        raw_manifests = await transport.get_manifests(manifest_hashes)
+
         fetches = [
-            (rel, meta, json.loads(raw))
-            for (rel, meta), raw in zip(to_fetch, raw_manifests)
+            (rel, meta, json.loads(raw_manifests[meta["manifest"]]))
+            for rel, meta in to_fetch
         ]
         all_block_hashes = [bh for _, _, m in fetches for bh in m["blocks"]]
         total_blocks = len(all_block_hashes)
 
-        click.echo(f"Downloading {total_blocks} blocks for {len(to_fetch)} file(s)...")
-        with click.progressbar(length=total_blocks, width=40) as bar:
-            fetched_blocks: list[bytes] = await transport.get_blocks(
-                all_block_hashes,
-                on_progress=lambda: bar.update(1),
-                concurrency=concurrency,
-            )
+        click.echo(f"Fetching {total_blocks} block(s) via tar...")
+        with click.progressbar(length=1, label="Downloading", width=40) as bar:
+            fetched_blocks = await transport.get_blocks(all_block_hashes)
+            bar.update(1)
 
-        # Reassemble files from the flat block list
         block_iter = iter(fetched_blocks)
         for rel, meta, manifest in fetches:
             blocks = [next(block_iter) for _ in manifest["blocks"]]
