@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 from pathlib import Path
 
 import click
@@ -79,18 +80,18 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
     for rel in deleted:
         del new_tree[rel]
 
-    click.echo(
-        f"Uploading {len(blocks_to_upload)} block(s) + "
-        f"{len(manifests_to_upload)} manifest(s)..."
-    )
     transport = await _connect(cfg)
     try:
-        with click.progressbar(length=len(blocks_to_upload), width=40) as bar:
-            await transport.put_blocks(
-                blocks_to_upload,
-                on_progress=lambda: bar.update(1),
-            )
-        await transport.put_manifests(manifests_to_upload)
+        if blocks_to_upload:
+            click.echo(f"Uploading {len(blocks_to_upload)} block(s)...")
+            with click.progressbar(length=len(blocks_to_upload), width=40) as bar:
+                await transport.put_blocks(
+                    blocks_to_upload,
+                    on_progress=lambda n: bar.update(n),
+                )
+        if manifests_to_upload:
+            click.echo(f"Uploading {len(manifests_to_upload)} manifest(s)...")
+            await transport.put_manifests(manifests_to_upload)
 
         commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
         await transport.put_commit(commit_hash, commit_data)
@@ -132,9 +133,12 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
             if index["tree"].get(rel, {}).get("sha256") != meta["sha256"]
         ]
 
-        click.echo(f"Fetching {len(to_fetch)} manifest(s)...")
         manifest_hashes = [meta["manifest"] for _, meta in to_fetch]
-        raw_manifests = await transport.get_manifests(manifest_hashes)
+        with click.progressbar(
+            length=len(manifest_hashes), label=f"Manifests", width=40
+        ) as bar:
+            raw_manifests = await transport.get_manifests(manifest_hashes)
+            bar.update(len(manifest_hashes))
 
         fetches = [
             (rel, meta, json.loads(raw_manifests[meta["manifest"]]))
@@ -143,11 +147,12 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
         all_block_hashes = [bh for _, _, m in fetches for bh in m["blocks"]]
         total_blocks = len(all_block_hashes)
 
-        click.echo(f"Fetching {total_blocks} block(s)...")
-        with click.progressbar(length=total_blocks, width=40) as bar:
+        with click.progressbar(
+            length=total_blocks, label=f"Blocks   ", width=40
+        ) as bar:
             fetched_blocks = await transport.get_blocks(
                 all_block_hashes,
-                on_progress=lambda: bar.update(1),
+                on_progress=lambda n: bar.update(n),
             )
 
         block_iter = iter(fetched_blocks)
@@ -200,31 +205,98 @@ def main():
 
 
 @main.command()
-@click.argument("name")
-@click.argument("path", type=click.Path())
-def init(name, path):
-    """Register a world and initialize GitCraft in it.
+@click.argument("name", required=False)
+@click.argument("path", required=False, type=click.Path())
+@click.argument("remote", required=False, metavar="[user@host:/remote/path]")
+@click.option("--port", "-p", default=8765, show_default=True, help="Port for the HTTP server on the remote.")
+@click.option("--key", "-k", default=None, help="SSH private key for remote setup.")
+@click.option("--password", default=None, help="SSH password for remote setup.")
+def init(name, path, remote, port, key, password):
+    """Register a world and set up the remote server.
 
     \b
-    Example:
-      gitcraft init survival ./saves/survival
+    With a remote (full setup — SSHes in, starts server, writes config):
+      gitcraft init survival ~/.minecraft/saves/survival user@host:/srv/gitcraft/survival
+
+    Without a remote (local only — edit config.toml manually afterwards):
+      gitcraft init survival ~/.minecraft/saves/survival
+
+    With no arguments, opens an interactive GUI wizard.
     """
+    if not name or not path:
+        try:
+            from .gui import run_init_wizard
+        except ImportError:
+            raise click.ClickException(
+                "GUI requires customtkinter: pip install customtkinter"
+            )
+        params = run_init_wizard()
+        if params is None:
+            return
+        name = params.name
+        path = params.path
+        remote = params.remote or None
+        port = params.port
+        key = params.key or None
+        password = params.password or None
+
     world_dir = Path(path).resolve()
     world_dir.mkdir(parents=True, exist_ok=True)
-
     cfg_path = world_dir / ".gitcraft" / "config.toml"
-    if not cfg_path.exists():
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if remote:
+        if "@" not in remote or ":" not in remote:
+            raise click.ClickException("Remote must be user@host:/path")
+        user_host, remote_path = remote.split(":", 1)
+        user, host = user_host.split("@", 1)
+        token = secrets.token_urlsafe(24)
+
+        click.echo(f"Connecting to {host}...")
+        try:
+            import asyncssh
+        except ImportError:
+            raise click.ClickException(
+                "Remote setup requires asyncssh: pip install asyncssh"
+            )
+
+        async def _setup():
+            connect_kwargs: dict = dict(
+                host=host, username=user, known_hosts=None
+            )
+            if password:
+                connect_kwargs["password"] = password
+            elif key:
+                connect_kwargs["client_keys"] = [key]
+
+            async with asyncssh.connect(**connect_kwargs) as conn:
+                cmd = (
+                    f"mkdir -p {remote_path} && "
+                    f"nohup gitcraft serve {remote_path} --port {port} --token {token} "
+                    f"> {remote_path}/serve.log 2>&1 & echo $!"
+                )
+                result = await conn.run(cmd, check=True)
+                return result.stdout.strip()
+
+        pid = asyncio.run(_setup())
+        url = f"http://{host}:{port}"
         cfg_path.write_text(
-            '[remote]\n'
-            'url = "http://your-server.example.com:8765"\n'
-            'token = "changeme"\n',
+            f'[remote]\nurl = "{url}"\ntoken = "{token}"\n',
             encoding="utf-8",
         )
+        click.echo(f"Remote server started (pid {pid}) → {url}")
+    else:
+        if not cfg_path.exists():
+            cfg_path.write_text(
+                '[remote]\n'
+                'url = "http://your-server.example.com:8765"\n'
+                'token = "changeme"\n',
+                encoding="utf-8",
+            )
+        click.echo(f"Edit {cfg_path} to configure your remote.")
 
     reg.register(name, world_dir)
     click.echo(f"World '{name}' → {world_dir}")
-    click.echo(f"Edit {cfg_path} to configure your remote.")
 
 
 @main.command()

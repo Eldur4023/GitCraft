@@ -72,7 +72,7 @@ class HTTPTransport:
     async def get_blocks(
         self,
         hashes: list[str],
-        on_progress: Callable | None = None,
+        on_progress: Callable[[int], None] | None = None,
         batch_size: int = 64,
     ) -> list[bytes]:
         if not hashes:
@@ -83,14 +83,14 @@ class HTTPTransport:
             raw = await self._fetch([self._block_path(h) for h in batch])
             for h in batch:
                 result[h] = gzip.decompress(raw[self._block_path(h)])
-                if on_progress:
-                    on_progress()
+            if on_progress:
+                on_progress(len(batch))
         return [result[h] for h in hashes]
 
     async def put_blocks(
         self,
         blocks: list[tuple[str, bytes]],
-        on_progress: Callable | None = None,
+        on_progress: Callable[[int], None] | None = None,
         batch_size: int = 64,
     ) -> None:
         if not blocks:
@@ -103,8 +103,7 @@ class HTTPTransport:
             }
             await self._push_tar(files)
             if on_progress:
-                for _ in batch:
-                    on_progress()
+                on_progress(len(batch))
 
     # ── Manifests ─────────────────────────────────────────────────────────────
 

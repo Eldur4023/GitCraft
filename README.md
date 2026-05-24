@@ -1,7 +1,7 @@
 # GitCraft
 
 Sync Minecraft worlds across machines without uploading everything every time.
-Inspired by Git and Steam Cloud Save — only the changed parts travel over the wire.
+Inspired by Git — only the changed parts travel over the wire.
 
 ## How it works
 
@@ -17,49 +17,88 @@ On pull, the client downloads the remote commit, compares it to its local state,
 └── objects/
     ├── commits/abc123...       ← {parent, timestamp, tree}
     ├── manifests/def456...     ← block list for each file version
-    └── blocks/3a/f7c2...       ← 4 KB chunks, gzip-compressed
+    └── blocks/3a/f7c2...       ← 512 KB chunks, gzip-compressed
 ```
 
-**The server is a plain SSH/SFTP server. No GitCraft code runs there.**
+All transfers happen over HTTP in batches — push and pull are a handful of requests regardless of how many files changed.
 
 ## Requirements
 
-- Python 3.11+
-- An SSH server with SFTP access (the machine that stores the world — can be a cheap VPS)
+**Client:** Python 3.10+, `pip install gitcraft`
+
+**Server:** Python 3.10+, `pip install gitcraft`
 
 ## Install
 
 ```bash
-pip install -e .
+pip install gitcraft
+```
+
+Optional dependencies:
+
+```bash
+pip install gitcraft[ssh]   # enables SSH remote setup via gitcraft init
+pip install customtkinter   # enables the GUI wizard (gitcraft init with no args)
 ```
 
 ## Setup
 
-### On the storage server (once)
+### The easy way — GUI wizard
+
+Run `gitcraft init` with no arguments to open the setup wizard:
 
 ```bash
-useradd -m gitcraft
-mkdir -p /srv/gitcraft/survival
-chown gitcraft /srv/gitcraft/survival
-# add your SSH public key to /home/gitcraft/.ssh/authorized_keys
+gitcraft init
 ```
 
-### On each client machine
+Fill in the world name, local path, and optionally the remote (`user@host:/path`), port, and SSH credentials (key file or password). GitCraft will SSH into the server, start the HTTP server in the background, and write the config automatically.
+
+### The manual way — CLI
 
 ```bash
-gitcraft init survival ./saves/survival
+gitcraft init survival ~/.minecraft/saves/survival user@host:/srv/gitcraft/survival
 ```
 
-Then edit `./saves/survival/.gitcraft/config.toml`:
+This does the same as the wizard: SSHes into the server, creates the directory, starts `gitcraft serve` in the background, and writes `~/.minecraft/saves/survival/.gitcraft/config.toml` with the URL and token.
 
-```toml
-[remote]
-host = "your-server.com"
-port = 22
-user = "gitcraft"
-key_file = "~/.ssh/id_rsa"
-path = "/srv/gitcraft/survival"
+With a password instead of an SSH key:
+
+```bash
+gitcraft init survival ~/.minecraft/saves/survival user@host:/srv/gitcraft/survival --password mypass
 ```
+
+With a specific key:
+
+```bash
+gitcraft init survival ~/.minecraft/saves/survival user@host:/srv/gitcraft/survival --key ~/.ssh/minecraft_rsa
+```
+
+Without a remote (write config manually afterwards):
+
+```bash
+gitcraft init survival ~/.minecraft/saves/survival
+# Edit ~/.minecraft/saves/survival/.gitcraft/config.toml
+```
+
+### Cloning an existing remote
+
+If the server is already running and the world has data:
+
+```bash
+gitcraft clone http://your-server.com:8765 survival ~/.minecraft/saves/survival --token yourtoken
+```
+
+### Starting the server manually
+
+If you prefer to start the server yourself (e.g. via systemd or tmux):
+
+```bash
+gitcraft serve /srv/gitcraft/survival --port 8765 --token yourtoken
+# or with an env var:
+GITCRAFT_TOKEN=yourtoken gitcraft serve /srv/gitcraft/survival
+```
+
+The path can be anywhere — it doesn't need to be next to your world files. For multiple worlds, run one instance per world on a different port.
 
 ## Usage
 
@@ -69,7 +108,7 @@ gitcraft push survival
 
 # On another machine:
 gitcraft pull survival
-# Start the server.
+# Start the server again.
 ```
 
 ```bash
@@ -78,9 +117,28 @@ gitcraft status survival    # show what would be pushed
 gitcraft log survival       # commit history
 ```
 
-> **Important:** always stop the server before pushing or pulling.
+> **Important:** always stop the Minecraft server before pushing or pulling.
 > Minecraft writes `.mca` region files non-atomically — syncing while the server
 > is running risks silent chunk corruption. GitCraft does not enforce this, so be careful!
+
+## Migrating from SSH transport
+
+If you were using the old SSH/SFTP config, update your `.gitcraft/config.toml`:
+
+```toml
+# Old (SSH/SFTP)
+[remote]
+host = "your-server.com"
+user = "gitcraft"
+path = "/srv/gitcraft/survival"
+
+# New (HTTP) — start gitcraft serve on the same path, then:
+[remote]
+url = "http://your-server.com:8765"
+token = "yourtoken"
+```
+
+The object store on disk is identical — no data migration needed.
 
 ## Why not rsync / syncthing / git-lfs?
 
@@ -89,4 +147,4 @@ gitcraft log survival       # commit history
 | rsync | uploads full files, no history |
 | Syncthing | syncs while server runs → corruption |
 | git-lfs | diffs text, not binary blocks; slow on large `.mca` |
-| GitCraft | block-level dedup, history, safe by design |
+| GitCraft | block-level dedup, history, HTTP transport |
