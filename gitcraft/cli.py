@@ -10,31 +10,33 @@ from .core.blocks import hash_file, split_blocks
 from .core.index import add_known_objects, load_index, load_known_objects, save_index
 from .core.objects import make_commit, make_manifest
 from .core.snapshot import scan
-from .transport.sftp import SSHTransport
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── transport factory ─────────────────────────────────────────────────────────
 
-def _world_dir(name: str) -> Path:
-    try:
-        return reg.resolve(name)
-    except KeyError:
-        raise click.ClickException(
-            f"Unknown world '{name}'. Run 'gitcraft init {name} <path>' first."
+async def _connect(cfg: dict):
+    r = cfg["remote"]
+    if "url" in r:
+        from .transport.http import HTTPTransport
+        return HTTPTransport(r["url"], r.get("token", ""))
+    else:
+        try:
+            from .transport.sftp import SSHTransport
+        except ImportError:
+            raise click.ClickException(
+                "SSH transport requires asyncssh: pip install asyncssh"
+            )
+        return await SSHTransport.connect(
+            host=r["host"],
+            port=r.get("port", 22),
+            user=r["user"],
+            remote_path=r["path"],
+            key_file=r.get("key_file"),
+            password=r.get("password"),
         )
 
 
-async def _connect(cfg: dict) -> SSHTransport:
-    r = cfg["remote"]
-    return await SSHTransport.connect(
-        host=r["host"],
-        port=r.get("port", 22),
-        user=r["user"],
-        remote_path=r["path"],
-        key_file=r.get("key_file"),
-        password=r.get("password"),
-    )
-
+# ── push / pull ───────────────────────────────────────────────────────────────
 
 async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool:
     index = load_index(world_dir)
@@ -79,15 +81,16 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
 
     click.echo(
         f"Uploading {len(blocks_to_upload)} block(s) + "
-        f"{len(manifests_to_upload)} manifest(s) via tar..."
+        f"{len(manifests_to_upload)} manifest(s)..."
     )
     transport = await _connect(cfg)
     try:
-        with click.progressbar(length=2, label="Uploading", width=40) as bar:
-            await transport.put_blocks(blocks_to_upload)
-            bar.update(1)
-            await transport.put_manifests(manifests_to_upload)
-            bar.update(1)
+        with click.progressbar(length=len(blocks_to_upload), width=40) as bar:
+            await transport.put_blocks(
+                blocks_to_upload,
+                on_progress=lambda: bar.update(1),
+            )
+        await transport.put_manifests(manifests_to_upload)
 
         commit_hash, commit_data = make_commit(index.get("head"), new_tree, message)
         await transport.put_commit(commit_hash, commit_data)
@@ -129,7 +132,7 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
             if index["tree"].get(rel, {}).get("sha256") != meta["sha256"]
         ]
 
-        click.echo(f"Fetching {len(to_fetch)} manifest(s) via tar...")
+        click.echo(f"Fetching {len(to_fetch)} manifest(s)...")
         manifest_hashes = [meta["manifest"] for _, meta in to_fetch]
         raw_manifests = await transport.get_manifests(manifest_hashes)
 
@@ -140,10 +143,12 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
         all_block_hashes = [bh for _, _, m in fetches for bh in m["blocks"]]
         total_blocks = len(all_block_hashes)
 
-        click.echo(f"Fetching {total_blocks} block(s) via tar...")
-        with click.progressbar(length=1, label="Downloading", width=40) as bar:
-            fetched_blocks = await transport.get_blocks(all_block_hashes)
-            bar.update(1)
+        click.echo(f"Fetching {total_blocks} block(s)...")
+        with click.progressbar(length=total_blocks, width=40) as bar:
+            fetched_blocks = await transport.get_blocks(
+                all_block_hashes,
+                on_progress=lambda: bar.update(1),
+            )
 
         block_iter = iter(fetched_blocks)
         for rel, meta, manifest in fetches:
@@ -176,6 +181,17 @@ def _pull(world_dir: Path, cfg: dict) -> bool:
     return asyncio.run(_pull_async(world_dir, cfg))
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _world_dir(name: str) -> Path:
+    try:
+        return reg.resolve(name)
+    except KeyError:
+        raise click.ClickException(
+            f"Unknown world '{name}'. Run 'gitcraft init {name} <path>' first."
+        )
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -201,11 +217,8 @@ def init(name, path):
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(
             '[remote]\n'
-            'host = "your-server.example.com"\n'
-            'port = 22\n'
-            'user = "minecraft"\n'
-            'key_file = "~/.ssh/id_rsa"\n'
-            f'path = "/srv/gitcraft/{name}"\n',
+            'url = "http://your-server.example.com:8765"\n'
+            'token = "changeme"\n',
             encoding="utf-8",
         )
 
@@ -218,38 +231,41 @@ def init(name, path):
 @click.argument("remote")
 @click.argument("name")
 @click.argument("path", default="", required=False)
-@click.option("--port", "-p", default=22, show_default=True)
+@click.option("--token", "-t", default="", help="Bearer token (HTTP remotes)")
+@click.option("--ssh-port", default=22, show_default=True)
 @click.option("--key", "-k", default="~/.ssh/id_rsa", show_default=True)
-def clone(remote, name, path, port, key):
-    """Clone a world from a remote into a local folder.
+def clone(remote, name, path, token, ssh_port, key):
+    """Clone a world from a remote.
 
     \b
-    REMOTE format:  user@host:/remote/path
-    Example:
-      gitcraft clone gitcraft@myserver.com:/srv/gitcraft/survival survival
-      gitcraft clone gitcraft@myserver.com:/srv/gitcraft/survival survival ./saves/survival
+    HTTP remote:
+      gitcraft clone http://myserver.com:8765 survival --token SECRET
+    SSH remote (legacy):
+      gitcraft clone user@host:/remote/path survival
     """
-    if "@" not in remote or ":" not in remote:
-        raise click.ClickException(
-            "Remote must be in the format user@host:/remote/path"
-        )
-    user_host, remote_path = remote.split(":", 1)
-    user, host = user_host.split("@", 1)
-
     world_dir = Path(path).resolve() if path else Path(name).resolve()
     world_dir.mkdir(parents=True, exist_ok=True)
 
     cfg_path = world_dir / ".gitcraft" / "config.toml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(
-        f'[remote]\n'
-        f'host = "{host}"\n'
-        f'port = {port}\n'
-        f'user = "{user}"\n'
-        f'key_file = "{key}"\n'
-        f'path = "{remote_path}"\n',
-        encoding="utf-8",
-    )
+
+    if remote.startswith("http://") or remote.startswith("https://"):
+        cfg_path.write_text(
+            f'[remote]\nurl = "{remote}"\ntoken = "{token}"\n',
+            encoding="utf-8",
+        )
+    else:
+        if "@" not in remote or ":" not in remote:
+            raise click.ClickException(
+                "SSH remote must be user@host:/path or an http(s):// URL."
+            )
+        user_host, remote_path = remote.split(":", 1)
+        user, host = user_host.split("@", 1)
+        cfg_path.write_text(
+            f'[remote]\nhost = "{host}"\nport = {ssh_port}\n'
+            f'user = "{user}"\nkey_file = "{key}"\npath = "{remote_path}"\n',
+            encoding="utf-8",
+        )
 
     reg.register(name, world_dir)
     click.echo(f"Cloning '{name}' from {remote} into {world_dir} ...")
@@ -307,32 +323,51 @@ def status(name):
     click.echo(f"\nHEAD: {head[:12] if head != 'none' else 'none'}")
 
 
-
-
 @main.command()
 @click.argument("name")
 @click.option("--limit", "-n", default=10, show_default=True)
 def log(name, limit):
     """Show commit history from the remote."""
-    world_dir = _world_dir(name)
-    cfg = load_config(world_dir)
-    transport = _connect(cfg)
-    try:
-        current = transport.get_head()
-        if not current:
-            click.echo("No commits.")
-            return
-        for _ in range(limit):
+    async def _run():
+        world_dir = _world_dir(name)
+        transport = await _connect(load_config(world_dir))
+        try:
+            current = await transport.get_head()
             if not current:
-                break
-            commit = json.loads(transport.get_commit(current))
-            ts = commit.get("timestamp", "?")
-            msg = commit.get("message", "")
-            n = len(commit.get("tree", {}))
-            click.echo(f"{current[:12]}  {ts}  {n} files  {msg}")
-            current = commit.get("parent")
-    finally:
-        transport.close()
+                click.echo("No commits.")
+                return
+            for _ in range(limit):
+                if not current:
+                    break
+                commit = json.loads(await transport.get_commit(current))
+                ts = commit.get("timestamp", "?")
+                msg = commit.get("message", "")
+                n = len(commit.get("tree", {}))
+                click.echo(f"{current[:12]}  {ts}  {n} files  {msg}")
+                current = commit.get("parent")
+        finally:
+            await transport.close()
+
+    asyncio.run(_run())
+
+
+@main.command()
+@click.argument("path", type=click.Path())
+@click.option("--port", default=8765, show_default=True)
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--token", envvar="GITCRAFT_TOKEN", required=True,
+              help="Bearer token for auth. Also read from GITCRAFT_TOKEN env var.")
+def serve(path, port, host, token):
+    """Run the GitCraft HTTP server at PATH.
+
+    \b
+    PATH is the remote objects directory — it can be anywhere.
+    Example:
+      gitcraft serve /srv/minecraft/worlds/survival --token s3cr3t
+      GITCRAFT_TOKEN=s3cr3t gitcraft serve /srv/minecraft/worlds/survival
+    """
+    from .server import run_server
+    run_server(Path(path), host, port, token)
 
 
 @main.command()
