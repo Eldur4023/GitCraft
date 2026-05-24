@@ -34,13 +34,6 @@ All transfers happen over HTTP in batches — push and pull are a handful of req
 pip install gitcraft
 ```
 
-Optional dependencies:
-
-```bash
-pip install gitcraft[ssh]   # enables SSH remote setup via gitcraft init
-pip install customtkinter   # enables the GUI wizard (gitcraft init with no args)
-```
-
 ## Setup
 
 ### The easy way — GUI wizard
