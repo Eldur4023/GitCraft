@@ -1,9 +1,12 @@
 import gzip
 import io
+import logging
 import tarfile
 from typing import Callable
 
 import asyncssh
+
+logger = logging.getLogger(__name__)
 
 
 class SSHTransport:
@@ -110,15 +113,20 @@ class SSHTransport:
         hashes: list[str],
         on_progress: Callable | None = None,
         batch_size: int = 64,
-    ) -> list[bytes]:
+    ) -> list[bytes | None]:
         if not hashes:
             return []
-        result: dict[str, bytes] = {}
+        result: dict[str, bytes | None] = {}
         for i in range(0, len(hashes), batch_size):
             batch = hashes[i : i + batch_size]
             raw = await self._tar_get([self._block_path(h) for h in batch])
             for h in batch:
-                result[h] = gzip.decompress(raw[self._block_path(h)])
+                path = self._block_path(h)
+                if path in raw:
+                    result[h] = gzip.decompress(raw[path])
+                else:
+                    logger.warning("Missing block on remote: %s", path)
+                    result[h] = None
                 if on_progress:
                     on_progress()
         return [result[h] for h in hashes]

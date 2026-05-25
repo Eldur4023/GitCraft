@@ -1,10 +1,15 @@
 import hashlib
 from pathlib import Path
 
-BLOCK_SIZE = 524288  # 512 KB
+BLOCK_SIZE = 4096  # 4 KB
 
 
 def hash_file(path: Path) -> str:
+    """Return the SHA-256 hex digest of *path*.
+
+    Raises OSError (including FileNotFoundError / PermissionError) if the
+    file cannot be read — callers are expected to handle this.
+    """
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):

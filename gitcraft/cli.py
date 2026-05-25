@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import secrets
 from pathlib import Path
@@ -11,6 +12,45 @@ from .core.blocks import hash_file, split_blocks
 from .core.index import add_known_objects, load_index, load_known_objects, save_index
 from .core.objects import make_commit, make_manifest
 from .core.snapshot import scan
+
+
+# ── error handling ────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _friendly_errors():
+    """Catch common errors and re-raise as click.ClickException."""
+    try:
+        yield
+    except click.ClickException:
+        raise  # already friendly
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except PermissionError as exc:
+        raise click.ClickException(f"Permission denied: {exc}") from exc
+    except KeyError as exc:
+        raise click.ClickException(f"Missing key: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Corrupt JSON data: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"I/O error: {exc}") from exc
+    except Exception as exc:
+        # Catch network errors by class name so we don't hard-depend on httpx
+        # at import time (it's only needed for HTTP transport).
+        exc_name = type(exc).__name__
+        if exc_name in ("ConnectError", "TimeoutException", "HTTPStatusError",
+                        "ConnectTimeout", "ReadTimeout", "WriteTimeout",
+                        "PoolTimeout"):
+            raise click.ClickException(
+                f"Network error: {exc}\n"
+                "  Check that the remote server is running and reachable."
+            ) from exc
+        if exc_name in ("DisconnectError", "ConnectionLost", "ChannelOpenError"):
+            raise click.ClickException(
+                f"SSH error: {exc}\n"
+                "  Check the SSH credentials and remote host."
+            ) from exc
+        # Unknown — still show a one-liner instead of a full traceback.
+        raise click.ClickException(f"Unexpected error ({exc_name}): {exc}") from exc
 
 
 # ── transport factory ─────────────────────────────────────────────────────────
@@ -43,7 +83,16 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
     index = load_index(world_dir)
     known = load_known_objects(world_dir)
     files = scan(world_dir)
-    hashes = {rel: hash_file(p) for rel, p in files.items()}
+
+    # Hash files, skipping any that became inaccessible since the scan.
+    hashes: dict[str, str] = {}
+    for rel, p in list(files.items()):
+        try:
+            hashes[rel] = hash_file(p)
+        except OSError as exc:
+            click.echo(f"⚠  Skipping {rel}: {exc}", err=True)
+            del files[rel]
+
     changed = {
         rel: (files[rel], hashes[rel])
         for rel in files
@@ -60,8 +109,14 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
     blocks_to_upload: list[tuple[str, bytes]] = []
     manifests_to_upload: list[tuple[str, bytes]] = []
 
-    for rel, (abs_path, file_hash) in changed.items():
-        data = abs_path.read_bytes()
+    skipped: list[str] = []
+    for rel, (abs_path, file_hash) in list(changed.items()):
+        try:
+            data = abs_path.read_bytes()
+        except OSError as exc:
+            click.echo(f"⚠  Cannot read {rel}, skipping: {exc}", err=True)
+            skipped.append(rel)
+            continue
         blocks = split_blocks(data)
         block_hashes = [h for h, _ in blocks]
         manifest_hash, manifest_data = make_manifest(block_hashes, len(data))
@@ -104,9 +159,11 @@ async def _push_async(world_dir: Path, cfg: dict, message: str = "auto") -> bool
     save_index(world_dir, index)
     add_known_objects(world_dir, new_known)
 
-    parts = [f"{len(changed)} changed"]
+    parts = [f"{len(changed) - len(skipped)} changed"]
     if deleted:
         parts.append(f"{len(deleted)} deleted")
+    if skipped:
+        parts.append(f"{len(skipped)} skipped")
     click.echo(f"[{commit_hash[:12]}] {', '.join(parts)}")
     return True
 
@@ -156,23 +213,43 @@ async def _pull_async(world_dir: Path, cfg: dict) -> bool:
             )
 
         block_iter = iter(fetched_blocks)
+        write_errors: list[str] = []
+        skipped_files: list[str] = []
         for rel, meta, manifest in fetches:
             blocks = [next(block_iter) for _ in manifest["blocks"]]
+            if any(b is None for b in blocks):
+                missing = sum(1 for b in blocks if b is None)
+                click.echo(
+                    f"⚠  Skipping {rel}: {missing} of {len(blocks)} block(s) missing on remote",
+                    err=True,
+                )
+                skipped_files.append(rel)
+                continue
             file_data = b"".join(blocks)[: manifest["size"]]
             dest = world_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(file_data)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(file_data)
+            except OSError as exc:
+                click.echo(f"⚠  Cannot write {rel}: {exc}", err=True)
+                write_errors.append(rel)
+
 
         for rel in list(index["tree"]):
             if rel not in remote_tree:
                 p = world_dir / rel
-                if p.exists():
-                    p.unlink()
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError as exc:
+                    click.echo(f"⚠  Cannot delete {rel}: {exc}", err=True)
 
         index.update({"head": remote_head, "tree": remote_tree})
         save_index(world_dir, index)
 
-        click.echo(f"[{remote_head[:12]}] Updated {len(to_fetch)} file(s).")
+        click.echo(f"[{remote_head[:12]}] Updated {len(to_fetch) - len(skipped_files)} file(s).")
+        if skipped_files:
+            click.echo(f"⚠  {len(skipped_files)} file(s) skipped due to missing blocks.", err=True)
         return True
     finally:
         await transport.close()
@@ -341,7 +418,8 @@ def clone(remote, name, path, token, ssh_port, key):
 
     reg.register(name, world_dir)
     click.echo(f"Cloning '{name}' from {remote} into {world_dir} ...")
-    _pull(world_dir, load_config(world_dir))
+    with _friendly_errors():
+        _pull(world_dir, load_config(world_dir))
 
 
 @main.command()
@@ -354,8 +432,9 @@ def push(name, message):
     Example:
       gitcraft push survival
     """
-    world_dir = _world_dir(name)
-    _push(world_dir, load_config(world_dir), message)
+    with _friendly_errors():
+        world_dir = _world_dir(name)
+        _push(world_dir, load_config(world_dir), message)
 
 
 @main.command()
@@ -367,32 +446,43 @@ def pull(name):
     Example:
       gitcraft pull survival
     """
-    world_dir = _world_dir(name)
-    _pull(world_dir, load_config(world_dir))
+    with _friendly_errors():
+        world_dir = _world_dir(name)
+        _pull(world_dir, load_config(world_dir))
 
 
 @main.command()
 @click.argument("name")
 def status(name):
     """Show local changes that would be pushed."""
-    world_dir = _world_dir(name)
-    index = load_index(world_dir)
-    files = scan(world_dir)
-    hashes = {rel: hash_file(p) for rel, p in files.items()}
+    with _friendly_errors():
+        world_dir = _world_dir(name)
+        index = load_index(world_dir)
+        files = scan(world_dir)
 
-    changed = [r for r in files if index["tree"].get(r, {}).get("sha256") != hashes[r]]
-    deleted = [r for r in index["tree"] if r not in files]
+        hashes: dict[str, str] = {}
+        for rel, p in files.items():
+            try:
+                hashes[rel] = hash_file(p)
+            except OSError as exc:
+                click.echo(f"⚠  Cannot read {rel}: {exc}", err=True)
 
-    if not changed and not deleted:
-        click.echo("Nothing to push.")
-    else:
-        for r in sorted(changed):
-            click.echo(f"  M  {r}")
-        for r in sorted(deleted):
-            click.echo(f"  D  {r}")
+        changed = [r for r in hashes if index["tree"].get(r, {}).get("sha256") != hashes[r]]
+        deleted = [r for r in index["tree"] if r not in files]
+        errored = [r for r in files if r not in hashes]
 
-    head = index.get("head") or "none"
-    click.echo(f"\nHEAD: {head[:12] if head != 'none' else 'none'}")
+        if not changed and not deleted and not errored:
+            click.echo("Nothing to push.")
+        else:
+            for r in sorted(changed):
+                click.echo(f"  M  {r}")
+            for r in sorted(deleted):
+                click.echo(f"  D  {r}")
+            for r in sorted(errored):
+                click.echo(f"  !  {r}")
+
+        head = index.get("head") or "none"
+        click.echo(f"\nHEAD: {head[:12] if head != 'none' else 'none'}")
 
 
 @main.command()
@@ -420,7 +510,8 @@ def log(name, limit):
         finally:
             await transport.close()
 
-    asyncio.run(_run())
+    with _friendly_errors():
+        asyncio.run(_run())
 
 
 @main.command()
