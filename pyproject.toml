@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minecraft-gitcraft"
-version = "0.1.2"
+version = "0.2.0"
 description = "Git-like incremental sync for Minecraft worlds"
 requires-python = ">=3.10"
 dependencies = [
